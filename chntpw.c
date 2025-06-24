@@ -63,10 +63,40 @@
 
 #include <openssl/des.h>
 #include <openssl/md4.h>
+#include <openssl/evp.h>
 #define uchar u_char
+
+/* Compatibility layer for OpenSSL 3.x */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+/* OpenSSL 3.x compatibility - use EVP interface */
+static int MD4_Init_compat(EVP_MD_CTX **ctx) {
+    *ctx = EVP_MD_CTX_new();
+    if (!*ctx) return 0;
+    return EVP_DigestInit_ex(*ctx, EVP_md4(), NULL);
+}
+
+static int MD4_Update_compat(EVP_MD_CTX *ctx, const void *data, size_t len) {
+    return EVP_DigestUpdate(ctx, data, len);
+}
+
+static int MD4_Final_compat(unsigned char *digest, EVP_MD_CTX *ctx) {
+    int ret = EVP_DigestFinal_ex(ctx, digest, NULL);
+    EVP_MD_CTX_free(ctx);
+    return ret;
+}
+
+/* Redefine MD4 context type for OpenSSL 3.x */
+#define MD4_CTX EVP_MD_CTX*
+#define MD4_Init(ctx) MD4_Init_compat(ctx)
+#define MD4_Update(ctx, data, len) MD4_Update_compat(*(ctx), data, len)
+#define MD4_Final(digest, ctx) MD4_Final_compat(digest, *(ctx))
+
+#else
+/* Legacy OpenSSL 1.x */
 #define MD4Init MD4_Init
 #define MD4Update MD4_Update
 #define MD4Final MD4_Final
+#endif
 
 #include "ntreg.h"
 #include "sam.h"
@@ -138,7 +168,7 @@ void str_to_key(unsigned char *str,unsigned char *key)
 	for (i=0;i<8;i++) {
 		key[i] = (key[i]<<1);
 	}
-	DES_set_odd_parity((des_cblock *)key);
+	DES_set_odd_parity((DES_cblock *)key);
 }
 
 /*
@@ -183,6 +213,26 @@ void sid_to_key2(uint32_t sid,unsigned char deskey[8])
 
 void E1(uchar *k, uchar *d, uchar *out)
 {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  /* OpenSSL 3.x: use EVP interface for DES */
+  EVP_CIPHER_CTX *ctx;
+  const EVP_CIPHER *cipher;
+  unsigned char deskey[8];
+  int len, final_len;
+  
+  ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return;
+  
+  cipher = EVP_des_ecb();
+  str_to_key(k, deskey);
+  
+  EVP_EncryptInit_ex(ctx, cipher, NULL, deskey, NULL);
+  EVP_CIPHER_CTX_set_padding(ctx, 0); /* No padding for ECB */
+  EVP_EncryptUpdate(ctx, out, &len, d, 8);
+  EVP_EncryptFinal_ex(ctx, out + len, &final_len);
+  EVP_CIPHER_CTX_free(ctx);
+#else
+  /* Legacy OpenSSL 1.x */
   des_key_schedule ks;
   des_cblock deskey;
 
@@ -193,6 +243,7 @@ void E1(uchar *k, uchar *d, uchar *out)
   des_set_key((des_cblock *)deskey,ks);
 #endif /* __FreeBsd__ */
   des_ecb_encrypt((des_cblock *)d,(des_cblock *)out, ks, DES_ENCRYPT);
+#endif
 }
 
 
@@ -500,8 +551,8 @@ char *change_pw(char *buf, int rid, int vlen, int stat)
    int dontchange = 0;
    struct user_V *v;
 
-   des_key_schedule ks1, ks2;
-   des_cblock deskey1, deskey2;
+   DES_key_schedule ks1, ks2;
+   DES_cblock deskey1, deskey2;
 
    MD4_CTX context;
    unsigned char digest[16];
@@ -619,21 +670,21 @@ char *change_pw(char *buf, int rid, int vlen, int stat)
 
    /* Get the two decrpt keys. */
    sid_to_key1(rid,(unsigned char *)deskey1);
-   des_set_key((des_cblock *)deskey1,ks1);
+   DES_set_key((DES_cblock *)deskey1,&ks1);
    sid_to_key2(rid,(unsigned char *)deskey2);
-   des_set_key((des_cblock *)deskey2,ks2);
+   DES_set_key((DES_cblock *)deskey2,&ks2);
    
    /* Decrypt the NT md4 password hash as two 8 byte blocks. */
-   des_ecb_encrypt((des_cblock *)(vp+ntpw_offs ),
-		   (des_cblock *)md4, ks1, DES_DECRYPT);
-   des_ecb_encrypt((des_cblock *)(vp+ntpw_offs + 8),
-		   (des_cblock *)&md4[8], ks2, DES_DECRYPT);
+   DES_ecb_encrypt((DES_cblock *)(vp+ntpw_offs ),
+		   (DES_cblock *)md4, &ks1, DES_DECRYPT);
+   DES_ecb_encrypt((DES_cblock *)(vp+ntpw_offs + 8),
+		   (DES_cblock *)&md4[8], &ks2, DES_DECRYPT);
 
    /* Decrypt the lanman password hash as two 8 byte blocks. */
-   des_ecb_encrypt((des_cblock *)(vp+lmpw_offs),
-		   (des_cblock *)lanman, ks1, DES_DECRYPT);
-   des_ecb_encrypt((des_cblock *)(vp+lmpw_offs + 8),
-		   (des_cblock *)&lanman[8], ks2, DES_DECRYPT);
+   DES_ecb_encrypt((DES_cblock *)(vp+lmpw_offs),
+		   (DES_cblock *)lanman, &ks1, DES_DECRYPT);
+   DES_ecb_encrypt((DES_cblock *)(vp+lmpw_offs + 8),
+		   (DES_cblock *)&lanman[8], &ks2, DES_DECRYPT);
       
    if (gverbose) {
      hexprnt("MD4 hash     : ",(unsigned char *)md4,16);
@@ -689,9 +740,10 @@ char *change_pw(char *buf, int rid, int vlen, int stat)
 
      /*   printf("Ucase Lanman: %s\n",newlanpw); */
    
-     MD4Init (&context);
-     MD4Update (&context, newunipw, pl<<1);
-     MD4Final (digest, &context);
+     MD4_CTX context;
+     MD4_Init(&context);
+     MD4_Update(&context, newunipw, pl<<1);
+     MD4_Final(digest, &context);
      
      if (gverbose) hexprnt("\nNEW MD4 hash    : ",digest,16);
      
@@ -701,15 +753,15 @@ char *change_pw(char *buf, int rid, int vlen, int stat)
      if (gverbose) hexprnt("NEW LANMAN hash : ",(unsigned char *)lanman,16);
      
      /* Encrypt the NT md4 password hash as two 8 byte blocks. */
-     des_ecb_encrypt((des_cblock *)digest,
-		     (des_cblock *)despw, ks1, DES_ENCRYPT);
-     des_ecb_encrypt((des_cblock *)(digest+8),
-		     (des_cblock *)&despw[8], ks2, DES_ENCRYPT);
+     DES_ecb_encrypt((DES_cblock *)digest,
+		     (DES_cblock *)despw, &ks1, DES_ENCRYPT);
+     DES_ecb_encrypt((DES_cblock *)(digest+8),
+		     (DES_cblock *)&despw[8], &ks2, DES_ENCRYPT);
      
-     des_ecb_encrypt((des_cblock *)lanman,
-		     (des_cblock *)newlandes, ks1, DES_ENCRYPT);
-     des_ecb_encrypt((des_cblock *)(lanman+8),
-		     (des_cblock *)&newlandes[8], ks2, DES_ENCRYPT);
+     DES_ecb_encrypt((DES_cblock *)lanman,
+		     (DES_cblock *)newlandes, &ks1, DES_ENCRYPT);
+     DES_ecb_encrypt((DES_cblock *)(lanman+8),
+		     (DES_cblock *)&newlandes[8], &ks2, DES_ENCRYPT);
      
      if (gverbose) {
        hexprnt("NEW DES crypt   : ",(unsigned char *)despw,16);
